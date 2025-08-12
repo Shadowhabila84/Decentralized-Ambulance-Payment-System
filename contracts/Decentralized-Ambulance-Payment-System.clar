@@ -13,6 +13,9 @@
 (define-data-var next-service-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var emergency-surcharge-percentage uint u10)
+(define-data-var base-rate-per-km uint u1000)
+(define-data-var demand-window-blocks uint u144)
+(define-data-var max-demand-multiplier uint u300)
 
 (define-map ambulance-services
     uint
@@ -79,6 +82,25 @@
     }
 )
 
+(define-map demand-tracking
+    uint
+    {
+        block-height: uint,
+        requests-count: uint,
+        region-hash: uint,
+    }
+)
+
+(define-map demand-aggregates
+    uint
+    {
+        window-start: uint,
+        total-requests: uint,
+        active-providers: uint,
+        average-multiplier: uint,
+    }
+)
+
 (define-public (register-provider
         (name (string-ascii 100))
         (license-number (string-ascii 50))
@@ -141,12 +163,15 @@
     )
     (let (
             (service-id (var-get next-service-id))
-            (base-cost (* distance-km u1000))
+            (region-hash (mod (+ (len pickup-location) (len destination)) u1000000))
+            (demand-multiplier (get-demand-multiplier region-hash))
+            (base-cost (* distance-km (var-get base-rate-per-km)))
+            (dynamic-cost (/ (* base-cost demand-multiplier) u100))
             (emergency-surcharge (if (> emergency-level u5)
-                (/ (* base-cost (var-get emergency-surcharge-percentage)) u100)
+                (/ (* dynamic-cost (var-get emergency-surcharge-percentage)) u100)
                 u0
             ))
-            (total-cost (+ base-cost emergency-surcharge))
+            (total-cost (+ dynamic-cost emergency-surcharge))
             (platform-fee (/ (* total-cost (var-get platform-fee-percentage)) u100))
             (provider-payment (- total-cost platform-fee))
         )
@@ -181,6 +206,7 @@
             provider-payment: provider-payment,
         })
 
+        (track-demand region-hash)
         (var-set next-service-id (+ service-id u1))
         (ok service-id)
     )
@@ -408,7 +434,7 @@
         (emergency-level uint)
     )
     (let (
-            (base-cost (* distance-km u1000))
+            (base-cost (* distance-km (var-get base-rate-per-km)))
             (emergency-surcharge (if (> emergency-level u5)
                 (/ (* base-cost (var-get emergency-surcharge-percentage)) u100)
                 u0
@@ -419,6 +445,122 @@
         )
         {
             base-cost: base-cost,
+            emergency-surcharge: emergency-surcharge,
+            total-cost: total-cost,
+            platform-fee: platform-fee,
+            provider-payment: provider-payment,
+        }
+    )
+)
+
+(define-private (get-demand-multiplier (region-hash uint))
+    (let (
+            (current-window (/ stacks-block-height (var-get demand-window-blocks)))
+            (window-key (+ (* current-window u1000000) (mod region-hash u1000000)))
+            (demand-data (default-to {
+                window-start: current-window,
+                total-requests: u0,
+                active-providers: u1,
+                average-multiplier: u100,
+            }
+                (map-get? demand-aggregates window-key)
+            ))
+            (requests (get total-requests demand-data))
+            (providers (if (> (get active-providers demand-data) u0)
+                (get active-providers demand-data)
+                u1
+            ))
+            (demand-ratio (/ requests providers))
+            (base-multiplier u100)
+            (calculated-multiplier (+ base-multiplier (* demand-ratio u50)))
+            (surge-factor (if (< calculated-multiplier (var-get max-demand-multiplier))
+                calculated-multiplier
+                (var-get max-demand-multiplier)
+            ))
+        )
+        surge-factor
+    )
+)
+
+(define-private (track-demand (region-hash uint))
+    (let (
+            (current-window (/ stacks-block-height (var-get demand-window-blocks)))
+            (window-key (+ (* current-window u1000000) (mod region-hash u1000000)))
+            (existing-data (default-to {
+                window-start: current-window,
+                total-requests: u0,
+                active-providers: u1,
+                average-multiplier: u100,
+            }
+                (map-get? demand-aggregates window-key)
+            ))
+            (new-request-count (+ (get total-requests existing-data) u1))
+        )
+        (map-set demand-aggregates window-key
+            (merge existing-data { total-requests: new-request-count })
+        )
+        true
+    )
+)
+
+(define-public (update-demand-config
+        (new-window-blocks uint)
+        (new-max-multiplier uint)
+        (new-base-rate uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-window-blocks u0) ERR_INVALID_SERVICE)
+        (asserts! (and (>= new-max-multiplier u100) (<= new-max-multiplier u500))
+            ERR_INVALID_SERVICE
+        )
+        (asserts! (> new-base-rate u0) ERR_INVALID_SERVICE)
+        (var-set demand-window-blocks new-window-blocks)
+        (var-set max-demand-multiplier new-max-multiplier)
+        (var-set base-rate-per-km new-base-rate)
+        (ok true)
+    )
+)
+
+(define-read-only (get-demand-info (region-hash uint))
+    (let (
+            (current-window (/ stacks-block-height (var-get demand-window-blocks)))
+            (window-key (+ (* current-window u1000000) (mod region-hash u1000000)))
+            (demand-data (map-get? demand-aggregates window-key))
+            (multiplier (get-demand-multiplier region-hash))
+        )
+        {
+            current-multiplier: multiplier,
+            window-data: demand-data,
+            window-start: current-window,
+            max-multiplier: (var-get max-demand-multiplier),
+        }
+    )
+)
+
+(define-read-only (calculate-dynamic-cost
+        (distance-km uint)
+        (emergency-level uint)
+        (pickup-location (string-ascii 100))
+        (destination (string-ascii 100))
+    )
+    (let (
+            (region-hash (mod (+ (len pickup-location) (len destination)) u1000000))
+            (demand-multiplier (get-demand-multiplier region-hash))
+            (base-cost (* distance-km (var-get base-rate-per-km)))
+            (dynamic-cost (/ (* base-cost demand-multiplier) u100))
+            (emergency-surcharge (if (> emergency-level u5)
+                (/ (* dynamic-cost (var-get emergency-surcharge-percentage)) u100)
+                u0
+            ))
+            (total-cost (+ dynamic-cost emergency-surcharge))
+            (platform-fee (/ (* total-cost (var-get platform-fee-percentage)) u100))
+            (provider-payment (- total-cost platform-fee))
+        )
+        {
+            base-cost: base-cost,
+            demand-multiplier: demand-multiplier,
+            dynamic-cost: dynamic-cost,
             emergency-surcharge: emergency-surcharge,
             total-cost: total-cost,
             platform-fee: platform-fee,
