@@ -9,6 +9,12 @@
 (define-constant ERR_INVALID_PATIENT (err u107))
 (define-constant ERR_SERVICE_NOT_AUTHORIZED (err u108))
 (define-constant ERR_REFUND_NOT_ALLOWED (err u109))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u110))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u111))
+(define-constant ERR_DISPUTE_ALREADY_RESOLVED (err u112))
+(define-constant ERR_INVALID_DISPUTE_REASON (err u113))
+(define-constant ERR_DISPUTE_TIMEOUT (err u114))
+(define-constant ERR_UNAUTHORIZED_RESOLVER (err u115))
 
 (define-data-var next-service-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
@@ -16,6 +22,9 @@
 (define-data-var base-rate-per-km uint u1000)
 (define-data-var demand-window-blocks uint u144)
 (define-data-var max-demand-multiplier uint u300)
+(define-data-var dispute-timeout-blocks uint u1008)
+(define-data-var next-dispute-id uint u1)
+(define-data-var arbitration-fee uint u10000)
 
 (define-map ambulance-services
     uint
@@ -98,6 +107,36 @@
         total-requests: uint,
         active-providers: uint,
         average-multiplier: uint,
+    }
+)
+
+(define-map service-disputes
+    uint
+    {
+        service-id: uint,
+        disputer: principal,
+        dispute-type: (string-ascii 20),
+        reason: (string-ascii 500),
+        evidence-hash: (string-ascii 64),
+        created-at: uint,
+        resolution-deadline: uint,
+        resolved: bool,
+        resolution: (string-ascii 20),
+        resolution-details: (string-ascii 500),
+        resolved-at: (optional uint),
+        arbitration-score: uint,
+    }
+)
+
+(define-map dispute-resolutions
+    uint
+    {
+        dispute-id: uint,
+        automatic-resolution: bool,
+        resolution-factors: (list 5 uint),
+        final-ruling: (string-ascii 20),
+        compensation-amount: uint,
+        penalty-amount: uint,
     }
 )
 
@@ -392,6 +431,123 @@
     )
 )
 
+(define-public (create-dispute
+        (service-id uint)
+        (dispute-type (string-ascii 20))
+        (reason (string-ascii 500))
+        (evidence-hash (string-ascii 64))
+    )
+    (let (
+            (dispute-id (var-get next-dispute-id))
+            (service-data (unwrap! (map-get? ambulance-services service-id)
+                ERR_SERVICE_NOT_FOUND
+            ))
+            (current-block stacks-block-height)
+            (resolution-deadline (+ current-block (var-get dispute-timeout-blocks)))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get patient service-data))
+                (is-eq tx-sender (get provider service-data))
+            )
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (is-none (map-get? service-disputes dispute-id))
+            ERR_DISPUTE_ALREADY_EXISTS
+        )
+        (asserts!
+            (or
+                (is-eq dispute-type "payment")
+                (is-eq dispute-type "service-quality")
+                (is-eq dispute-type "no-show")
+                (is-eq dispute-type "overcharge")
+            )
+            ERR_INVALID_DISPUTE_REASON
+        )
+
+        (map-set service-disputes dispute-id {
+            service-id: service-id,
+            disputer: tx-sender,
+            dispute-type: dispute-type,
+            reason: reason,
+            evidence-hash: evidence-hash,
+            created-at: current-block,
+            resolution-deadline: resolution-deadline,
+            resolved: false,
+            resolution: "pending",
+            resolution-details: "",
+            resolved-at: none,
+            arbitration-score: u0,
+        })
+
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let (
+            (dispute-data (unwrap! (map-get? service-disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+            (service-data (unwrap! (map-get? ambulance-services (get service-id dispute-data))
+                ERR_SERVICE_NOT_FOUND
+            ))
+            (current-block stacks-block-height)
+            (arbitration-score (calculate-arbitration-score dispute-data service-data))
+            (resolution-ruling (determine-resolution-ruling arbitration-score
+                (get dispute-type dispute-data)
+            ))
+        )
+        (asserts! (not (get resolved dispute-data)) ERR_DISPUTE_ALREADY_RESOLVED)
+        (asserts! (> current-block (get resolution-deadline dispute-data))
+            ERR_DISPUTE_TIMEOUT
+        )
+
+        (let (
+                (compensation (calculate-compensation arbitration-score
+                    (get total-cost service-data)
+                ))
+                (penalty (calculate-penalty arbitration-score
+                    (get total-cost service-data)
+                ))
+            )
+            (map-set service-disputes dispute-id
+                (merge dispute-data {
+                    resolved: true,
+                    resolution: resolution-ruling,
+                    resolution-details: "Automated arbitration based on service metrics",
+                    resolved-at: (some current-block),
+                    arbitration-score: arbitration-score,
+                })
+            )
+
+            (map-set dispute-resolutions dispute-id {
+                dispute-id: dispute-id,
+                automatic-resolution: true,
+                resolution-factors: (list arbitration-score u100 u200 u300 u400),
+                final-ruling: resolution-ruling,
+                compensation-amount: compensation,
+                penalty-amount: penalty,
+            })
+
+            (begin
+                (if (is-eq resolution-ruling "patient-favor")
+                    (try! (as-contract (stx-transfer? compensation tx-sender
+                        (get patient service-data)
+                    )))
+                    true
+                )
+
+                (if (is-eq resolution-ruling "provider-penalty")
+                    (update-provider-rating (get provider service-data) false)
+                    true
+                )
+
+                (ok true)
+            )
+        )
+    )
+)
+
 (define-public (update-platform-fee (new-fee uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -429,6 +585,18 @@
     (var-get next-service-id)
 )
 
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? service-disputes dispute-id)
+)
+
+(define-read-only (get-dispute-resolution (dispute-id uint))
+    (map-get? dispute-resolutions dispute-id)
+)
+
+(define-read-only (get-next-dispute-id)
+    (var-get next-dispute-id)
+)
+
 (define-read-only (calculate-service-cost
         (distance-km uint)
         (emergency-level uint)
@@ -450,6 +618,130 @@
             platform-fee: platform-fee,
             provider-payment: provider-payment,
         }
+    )
+)
+
+(define-private (calculate-arbitration-score
+        (dispute-data {
+            service-id: uint,
+            disputer: principal,
+            dispute-type: (string-ascii 20),
+            reason: (string-ascii 500),
+            evidence-hash: (string-ascii 64),
+            created-at: uint,
+            resolution-deadline: uint,
+            resolved: bool,
+            resolution: (string-ascii 20),
+            resolution-details: (string-ascii 500),
+            resolved-at: (optional uint),
+            arbitration-score: uint,
+        })
+        (service-data {
+            patient: principal,
+            provider: principal,
+            service-type: (string-ascii 50),
+            base-cost: uint,
+            emergency-level: uint,
+            pickup-location: (string-ascii 100),
+            destination: (string-ascii 100),
+            distance-km: uint,
+            created-at: uint,
+            completed-at: (optional uint),
+            payment-status: (string-ascii 20),
+            total-cost: uint,
+            platform-fee: uint,
+            provider-payment: uint,
+        })
+    )
+    (let (
+            (provider-rating (default-to u50
+                (get rating
+                    (map-get? authorized-providers (get provider service-data))
+                )))
+            (service-completion-time (default-to u0 (get completed-at service-data)))
+            (time-factor (if (> service-completion-time u0)
+                (if (> service-completion-time
+                        (+ (get created-at service-data) u72)
+                    )
+                    u25
+                    u75
+                )
+                u0
+            ))
+            (rating-factor (if (> provider-rating u70)
+                u75
+                u25
+            ))
+            (emergency-factor (if (> (get emergency-level service-data) u7)
+                u85
+                u50
+            ))
+        )
+        (/ (+ time-factor rating-factor emergency-factor) u3)
+    )
+)
+
+(define-private (determine-resolution-ruling
+        (score uint)
+        (dispute-type (string-ascii 20))
+    )
+    (if (> score u60)
+        (if (or (is-eq dispute-type "payment") (is-eq dispute-type "overcharge"))
+            "patient-favor"
+            "provider-favor"
+        )
+        (if (or (is-eq dispute-type "no-show") (is-eq dispute-type "service-quality"))
+            "provider-penalty"
+            "neutral"
+        )
+    )
+)
+
+(define-private (calculate-compensation
+        (score uint)
+        (total-cost uint)
+    )
+    (if (> score u70)
+        (/ (* total-cost u75) u100)
+        (if (> score u40)
+            (/ (* total-cost u50) u100)
+            (/ (* total-cost u25) u100)
+        )
+    )
+)
+
+(define-private (calculate-penalty
+        (score uint)
+        (total-cost uint)
+    )
+    (if (< score u30)
+        (/ (* total-cost u20) u100)
+        u0
+    )
+)
+
+(define-private (update-provider-rating
+        (provider principal)
+        (positive bool)
+    )
+    (match (map-get? authorized-providers provider)
+        provider-data (let (
+                (current-rating (get rating provider-data))
+                (adjustment (if positive
+                    u5
+                    (- u0 u10)
+                ))
+                (new-rating (if (and (not positive) (< current-rating u10))
+                    u0
+                    (+ current-rating adjustment)
+                ))
+            )
+            (map-set authorized-providers provider
+                (merge provider-data { rating: new-rating })
+            )
+            true
+        )
+        false
     )
 )
 
